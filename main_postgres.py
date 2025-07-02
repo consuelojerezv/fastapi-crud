@@ -1,15 +1,14 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, status
 from pydantic import BaseModel, EmailStr, constr
 import databases
 import bcrypt
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
-from fastapi import Depends, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from dotoenv import load_dotenv
+from dotenv import load_dotenv
 import os
 
-load_dotenv
+load_dotenv()
 
 
 
