@@ -2,8 +2,25 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, EmailStr, constr
 import databases
 import bcrypt
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+from fastapi import Depends, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from dotoenv import load_dotenv
+import os
 
-DATABASE_URL = "postgresql://consu:Consuelo123%23@186.64.122.150:5432/proyectos"
+load_dotenv
+
+
+
+
+SECRET_KEY = os.getenv ("SECRET_KEY")  # DE ESTA FORMA LLAMO DE FORMA SEGURA EL ARCHIVO QUE CONTIENE LA CLAVE 
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+
+DATABASE_URL = os.getenv("DATABASE_URL") #LLAMO LA BASE DE DATOS DE FORMA SEGURA
 
 database = databases.Database(DATABASE_URL)
 
@@ -109,3 +126,65 @@ async def eliminar_usuario(usuario_id: int):
     if result is None:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
     return {"mensaje": "Usuario eliminado correctamente"}
+
+class LoginData(BaseModel):
+    username: str
+    password: str
+
+class PasswordChange(BaseModel):
+    nueva_password: constr(min_length=6)
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+
+async def obtener_usuario_actual(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="No se pudo validar las credenciales",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    query = "SELECT * FROM usuario WHERE username = :username"
+    user = await database.fetch_one(query, values={"username": username})
+    if user is None:
+        raise credentials_exception
+    return user
+
+@app.post("/login", response_model=TokenResponse)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    query = "SELECT * FROM usuario WHERE username = :username"
+    user = await database.fetch_one(query, values={"username": form_data.username})
+    if user is None:
+        raise HTTPException(status_code=401, detail="Usuario no encontrado")
+
+    if not bcrypt.checkpw(form_data.password.encode('utf-8'), user["password"].encode('utf-8')):
+        raise HTTPException(status_code=401, detail="Contraseña incorrecta")
+
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {"sub": user["username"], "exp": expire}
+    token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@app.post("/cambiar_password")
+async def cambiar_password(datos: PasswordChange, usuario_actual=Depends(obtener_usuario_actual)):
+    hashed_password = bcrypt.hashpw(datos.nueva_password.encode('utf-8'), bcrypt.gensalt())
+    query = """
+        UPDATE usuario
+        SET password = :password
+        WHERE username = :username
+    """
+    await database.execute(query, values={
+        "password": hashed_password.decode('utf-8'),
+        "username": usuario_actual["username"]
+    })
+    return {"mensaje": "Contraseña actualizada correctamente"}

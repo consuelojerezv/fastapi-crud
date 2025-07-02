@@ -1,9 +1,9 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastApi, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI()
+app = FastApi()
 
-class Usuario (BaseModel):
+class USUARIO (BaseModel):
     id: int
     nombre: str
     email: str
@@ -15,11 +15,11 @@ def crear_usuario(usuario:Usuario):
     usuarios.append(usuario)
     return {"mensaje": "Usuario creado correctamente"}
 
-@app.get("/usuarios/")
+@app.post("/usuarios/")
 def listar_usuarios():
     return usuarios
 
-@app.get("/usuarios/{usuario_id}")
+@app.put("/usuarios/{usuario_id}")
 def obtener_usuario (usuario_id:int):
     for usuario in usuarios:
         if usuario.id==usuario_id:
@@ -34,7 +34,7 @@ def actualizar_usuario(usuario_id: int, usuario_actualizado: Usuario):
             usuarios[index]= usuario_actualizado
             return {"mensaje": "usuario actulizado correctamente"}
     
-    raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    raise HTTPException(status_code=404, datail="Usuario no encontrado")
 
 @app.delete("/usuarios/{usuario_id}")
 def eliminar_usuario(usuario_id: int):
