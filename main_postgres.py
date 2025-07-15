@@ -7,6 +7,12 @@ from datetime import datetime, timedelta
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from dotenv import load_dotenv
 import os
+from authlib.integrations.starlette_client import OAuth
+from starlette.requests import Request
+from fastapi.responses import RedirectResponse
+from starlette.middleware.sessions import SessionMiddleware
+
+
 
 load_dotenv()
 
@@ -24,6 +30,25 @@ DATABASE_URL = os.getenv("DATABASE_URL") #LLAMO LA BASE DE DATOS DE FORMA SEGURA
 database = databases.Database(DATABASE_URL)
 
 app = FastAPI()
+
+app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
+
+oauth = OAuth()
+
+oauth.register(
+    name='microsoft',
+    client_id=os.getenv("MICROSOFT_CLIENT_ID"),
+    client_secret=os.getenv("MICROSOFT_CLIENT_SECRET"),
+    access_token_url='https://login.microsoftonline.com/common/oauth2/v2.0/token',
+    authorize_url='https://login.microsoftonline.com/common/oauth2/v2.0/authorize',
+    api_base_url='https://graph.microsoft.com/v1.0/',
+    client_kwargs={
+        'scope': 'User.Read',
+    }
+)
+
+
+
 
 class UsuarioIn(BaseModel):
     username: constr(min_length=3, max_length=50)
@@ -187,3 +212,19 @@ async def cambiar_password(datos: PasswordChange, usuario_actual=Depends(obtener
         "username": usuario_actual["username"]
     })
     return {"mensaje": "Contraseña actualizada correctamente"}
+
+@app.get("/login-microsoft")
+async def login_microsoft(request: Request):
+    redirect_uri = os.getenv("MICROSOFT_REDIRECT_URI")
+    return await oauth.microsoft.authorize_redirect(request, redirect_uri)
+
+@app.get("/login-microsoft/callback")
+async def auth_microsoft_callback(request: Request):
+    try:
+        token = await oauth.microsoft.authorize_access_token(request)
+        user_data = await oauth.microsoft.get("me", token=token)
+        profile = user_data.json()
+        return {"mensaje": "Login exitoso con Microsoft", "usuario": profile}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error en login de Microsoft: {str(e)}")
+
