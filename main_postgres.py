@@ -48,6 +48,18 @@ oauth.register(
 )
 
 
+# Registro de Google 
+oauth.register(
+    name='google',
+    client_id=os.getenv("GOOGLE_CLIENT_ID"),
+    client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+    access_token_url='https://oauth2.googleapis.com/token',
+    authorize_url='https://accounts.google.com/o/oauth2/auth',
+    api_base_url='https://www.googleapis.com/oauth2/v2/',
+    client_kwargs={
+        'scope': 'openid email profile',
+    }
+)
 
 
 class UsuarioIn(BaseModel):
@@ -213,6 +225,7 @@ async def cambiar_password(datos: PasswordChange, usuario_actual=Depends(obtener
     })
     return {"mensaje": "Contraseña actualizada correctamente"}
 
+#MICROSOFT
 @app.get("/login-microsoft")
 async def login_microsoft(request: Request):
     redirect_uri = os.getenv("MICROSOFT_REDIRECT_URI")
@@ -227,4 +240,53 @@ async def auth_microsoft_callback(request: Request):
         return {"mensaje": "Login exitoso con Microsoft", "usuario": profile}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error en login de Microsoft: {str(e)}")
+
+
+#GOOGLE
+
+@app.get("/login-google")
+async def login_google(request: Request):
+    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI")
+    return await oauth.google.authorize_redirect(request, redirect_uri)
+
+
+@app.get("/login-google/callback")
+async def google_callback(request: Request):
+    try:
+        # 1. Obtener token
+        token = await oauth.google.authorize_access_token(request)
+        user_data = await oauth.google.get("userinfo", token=token)
+        profile = user_data.json()
+
+        email = profile.get("email")
+        if not email:
+            raise HTTPException(status_code=400, detail="No se pudo obtener el correo")
+
+        # 2. Buscar en la BD
+        query = "SELECT * FROM usuario WHERE email = :email"
+        user = await database.fetch_one(query, values={"email": email})
+        if not user:
+            raise HTTPException(status_code=401, detail="Usuario no registrado")
+
+        if not user["activo"]:
+            raise HTTPException(status_code=403, detail="Usuario inactivo")
+
+        # 3. Crear token
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        payload = {"sub": user["username"], "exp": expire}
+        token_jwt = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+        return {
+            "mensaje": "Login con Google exitoso",
+            "usuario": {
+                "username": user["username"],
+                "email": user["email"],
+                "fono": user["fono"].strip()
+            },
+            "access_token": token_jwt,
+            "token_type": "bearer"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error en login con Google: {str(e)}")
 
