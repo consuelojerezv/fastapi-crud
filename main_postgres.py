@@ -126,13 +126,13 @@ async def crear_usuario(usuario: UsuarioIn):
 
 @app.get("/usuarios/", response_model=list[UsuarioOut])
 async def listar_usuarios(usuario_actual=Depends(obtener_usuario_actual)):
-    query = "SELECT * FROM usuario"
+    query = "SELECT * FROM usuario WHERE eliminado = FALSE"
     rows = await database.fetch_all(query)
     return [{**dict(row), "fono": row["fono"].strip()} for row in rows]
 
 @app.get("/usuarios/{usuario_id}", response_model=UsuarioOut)
 async def obtener_usuario(usuario_id: int, usuario_actual=Depends(obtener_usuario_actual)):
-    query = "SELECT * FROM usuario WHERE id = :id"
+    query = "SELECT * FROM usuario WHERE id = :id AND eliminado = FALSE"
     result = await database.fetch_one(query, values={"id": usuario_id})
     if result is None:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
@@ -167,11 +167,17 @@ async def actualizar_usuario(usuario_id: int, usuario: UsuarioIn, usuario_actual
 
 @app.delete("/usuarios/{usuario_id}")
 async def eliminar_usuario(usuario_id: int, usuario_actual=Depends(obtener_usuario_actual)):
-    query = "DELETE FROM usuario WHERE id = :id RETURNING id"
+    query = """
+        UPDATE usuario
+        SET eliminado = TRUE
+        WHERE id = :id AND eliminado = FALSE
+        RETURNING id
+    """
     result = await database.fetch_one(query, values={"id": usuario_id})
     if result is None:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado")
-    return {"mensaje": "Usuario eliminado correctamente"}
+        raise HTTPException(status_code=404, detail="Usuario no encontrado o ya estaba eliminado")
+    return {"mensaje": "Usuario marcado como eliminado"}
+
 
 class LoginData(BaseModel):
     username: str
@@ -206,7 +212,7 @@ async def obtener_usuario_actual(token: str = Depends(oauth2_scheme)):
 
 @app.post("/login", response_model=TokenResponse)
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    query = "SELECT * FROM usuario WHERE username = :username"
+    query = "SELECT * FROM usuario WHERE username = :username AND eliminado = FALSE"
     user = await database.fetch_one(query, values={"username": form_data.username})
     if user is None:
         raise HTTPException(status_code=401, detail="Usuario no encontrado")
