@@ -121,16 +121,18 @@ class ProyectoOut(ProyectoIn):
 
 class EquipoIn(BaseModel):
     proyecto_id: int
+    usuario_id: int
     rol: str
-    dedicacion: float
-    fecha_desde: datetime
-    fecha_hasta: datetime
-    comentario: Optional[str]
+    dedicacion: float  
+    fecha_desde: date
+    fecha_hasta: date
+    comentario: Optional[str] = None
 
 class EquipoOut(EquipoIn):
     id: int
+    usuario_nombre: Optional[str] = None
 
-# ====== CAMBIO: AvanceIn SIN "estado" ======
+
 class AvanceIn(BaseModel):
     proyecto_id: int
     fecha: date
@@ -144,14 +146,14 @@ class AvanceOut(AvanceIn):
 
 class FacturaIn(BaseModel):
     proyecto_id: int
-    fecha: datetime
-    hito: str
-    estado: str
-    fecha_estado: datetime
+    fecha: date                       
+    hito: str = Field(..., max_length=10)
+    estado: str = Field(..., max_length=10)
+    fecha_estado: date                
 
 class FacturaOut(FacturaIn):
     id: int
-
+    usuario_id: int | None = None
 
 def build_nombre_compuesto(anio: str, tipo: str, correlativo: int, cod: str) -> str:
     t = (tipo or "").strip().upper()
@@ -341,7 +343,7 @@ async def patch_propuesta(propuesta_id: int, body: dict = Body(...)):
     if "cod_cliente" in data and isinstance(data["cod_cliente"], str):
         data["cod_cliente"] = data["cod_cliente"].strip().upper()
 
-    # Trae valores actuales para poder recalcular
+
     actual = await database.fetch_one(
         """
         SELECT rtrim("año") AS anio, rtrim(tipo) AS tipo, correlativo, rtrim(cod_cliente) AS cod_cliente
@@ -358,7 +360,7 @@ async def patch_propuesta(propuesta_id: int, body: dict = Body(...)):
     correlativo_final = data.get("correlativo", actual["correlativo"])
     cod_final         = data.get("cod_cliente", actual["cod_cliente"])
 
-    # Si cambian piezas del nombre o no lo mandan, lo recalculamos
+  
     tocaron_partes = any(k in data for k in ("anio","tipo","correlativo","cod_cliente"))
     if tocaron_partes or "nombre_propuesta" not in data:
         data["nombre_propuesta"] = build_nombre_compuesto(
@@ -438,7 +440,6 @@ async def crear_proyecto(p: ProyectoIn):
         values={**p.dict(), "estado": p.estado.strip().upper()},
     )
 
-    # Devolvemos el proyecto recién creado con anio y nombre_propuesta desde propuesta
     row = await database.fetch_one(
         """
         SELECT
@@ -608,7 +609,7 @@ async def eliminar_proyecto(proyecto_id: int):
     return {"mensaje": "Proyecto eliminado"}
 
 # ======================
-# AVANCES — Estado SIEMPRE = estado del proyecto
+# AVANCES 
 # ======================
 
 @app.post("/avances/", response_model=AvanceOut)
@@ -721,7 +722,7 @@ async def patch_avance(avance_id: int, body: dict = Body(...)):
     if not actual:
         raise HTTPException(status_code=404, detail="Avance no encontrado")
 
-    # Estado actual del proyecto
+ 
     estado_proyecto = await database.fetch_one(
         'SELECT rtrim(estado) AS estado FROM proyecto WHERE id = :id',
         values={'id': actual["proyecto_id"]},
@@ -734,7 +735,6 @@ async def patch_avance(avance_id: int, body: dict = Body(...)):
         set_parts.append(f"{k} = :{k}")
         vals[k] = v
 
-    # Reforzar estado del avance = estado del proyecto
     set_parts.append("estado = :estado")
     vals["estado"] = (estado_proyecto["estado"] or "").strip().upper()
 
@@ -753,33 +753,275 @@ async def patch_avance(avance_id: int, body: dict = Body(...)):
     return dict(row)
 
 # ======================
+# EQUIPOS
+# ======================
+
+async def _validar_equipo_basico(e: EquipoIn | dict, equipo_id: int | None = None):
+    """Valida fechas dentro del proyecto y dedicación acumulada <= 100%."""
+    # Trae el proyecto
+    proy = await database.fetch_one(
+        'SELECT id, fecha_inicio, fecha_termino FROM proyecto WHERE id = :id AND rtrim(estado) <> \'ELIMINADO\'',
+        values={'id': e["proyecto_id"] if isinstance(e, dict) else e.proyecto_id},
+    )
+    if not proy:
+        raise HTTPException(404, "Proyecto no encontrado")
+
+    fd = e["fecha_desde"] if isinstance(e, dict) else e.fecha_desde
+    fh = e["fecha_hasta"] if isinstance(e, dict) else e.fecha_hasta
+    if fd > fh:
+        raise HTTPException(400, "fecha_desde no puede ser mayor que fecha_hasta")
+    if not (proy["fecha_inicio"] <= fd <= proy["fecha_termino"]) or not (proy["fecha_inicio"] <= fh <= proy["fecha_termino"]):
+        raise HTTPException(400, "Las fechas deben estar dentro del rango del proyecto")
+
+    usuario_id = e["usuario_id"] if isinstance(e, dict) else e.usuario_id
+    proyecto_id = e["proyecto_id"] if isinstance(e, dict) else e.proyecto_id
+    dedicacion = e["dedicacion"] if isinstance(e, dict) else e.dedicacion
+
+    row = await database.fetch_one(
+        """
+        SELECT COALESCE(SUM(dedicacion),0) AS total
+          FROM equipo
+         WHERE usuario_id = :u
+           AND proyecto_id = :p
+           AND NOT (fecha_hasta < :desde OR fecha_desde > :hasta)
+           AND id <> COALESCE(:id, -1)
+        """,
+        values={"u": usuario_id, "p": proyecto_id, "desde": fd, "hasta": fh, "id": equipo_id},
+    )
+    total = float(row["total"] or 0.0)
+    if total + float(dedicacion) > 100.0 + 1e-6:
+        raise HTTPException(400, f"El usuario ya acumula {total:.0f}% en ese período; no puede superar 100%.")
+    return True
+
+@app.post("/equipos/", response_model=EquipoOut)
+async def crear_equipo(e: EquipoIn, usuario_actual=Depends(obtener_usuario_actual)):
+    if not (0 <= e.dedicacion <= 100):
+        raise HTTPException(status_code=400, detail="La dedicación debe ser entre 0 y 100")
+    if e.fecha_desde > e.fecha_hasta:
+        raise HTTPException(status_code=400, detail="La fecha_desde no puede ser mayor a fecha_hasta")
+
+    proy = await database.fetch_one(
+        'SELECT id FROM proyecto WHERE id = :id AND rtrim(estado) <> \'ELIMINADO\'',
+        values={'id': e.proyecto_id},
+    )
+    if not proy:
+        raise HTTPException(status_code=404, detail="Proyecto no existe o está eliminado")
+
+    usu = await database.fetch_one('SELECT id FROM usuario WHERE id = :id', values={'id': e.usuario_id})
+    if not usu:
+        raise HTTPException(status_code=404, detail="Usuario no existe")
+
+
+    total = await database.fetch_one(
+        """
+        SELECT COALESCE(SUM(dedicacion), 0) AS total
+          FROM equipo
+         WHERE proyecto_id = :p
+           AND usuario_id  = :u
+           AND NOT (:hasta < fecha_desde OR :desde > fecha_hasta)
+        """,
+        values={'p': e.proyecto_id, 'u': e.usuario_id, 'desde': e.fecha_desde, 'hasta': e.fecha_hasta},
+    )
+    if float(total["total"]) + e.dedicacion > 100:
+        raise HTTPException(status_code=400, detail="La dedicación acumulada superaría 100% en el período")
+
+
+    row = await database.fetch_one(
+        """
+        INSERT INTO equipo (proyecto_id, rol, dedicacion, fecha_desde, fecha_hasta, comentario, usuario_id)
+        VALUES (:proyecto_id, :rol, :dedicacion, :fecha_desde, :fecha_hasta, :comentario, :usuario_id)
+        RETURNING id, proyecto_id, rol, dedicacion, fecha_desde, fecha_hasta, comentario, usuario_id
+        """,
+        values=e.dict(),
+    )
+    return dict(row)
+
+
+@app.get("/equipos/", response_model=list[EquipoOut])
+async def listar_equipos(proyecto_id: int = Query(...)):
+    rows = await database.fetch_all(
+        """
+        SELECT e.id, e.proyecto_id, e.usuario_id, u.username AS usuario_nombre,
+               rtrim(e.rol) AS rol, e.dedicacion, e.fecha_desde, e.fecha_hasta, e.comentario
+          FROM equipo e
+          JOIN usuario u ON u.id = e.usuario_id
+         WHERE e.proyecto_id = :p
+         ORDER BY e.fecha_desde, e.id
+        """,
+        values={"p": proyecto_id},
+    )
+    return [dict(r) for r in rows]
+
+@app.patch("/equipos/{equipo_id}", response_model=EquipoOut)
+async def patch_equipo(equipo_id: int, body: dict = Body(...)):
+    allowed = {"rol","dedicacion","fecha_desde","fecha_hasta","comentario","usuario_id"}
+    data = {k: v for k, v in body.items() if k in allowed}
+    if not data:
+        raise HTTPException(status_code=400, detail="Nada para actualizar")
+
+    actual = await database.fetch_one("SELECT * FROM equipo WHERE id = :id", values={"id": equipo_id})
+    if not actual:
+        raise HTTPException(status_code=404, detail="Equipo no encontrado")
+
+    rol           = data.get("rol", actual["rol"])
+    dedicacion    = float(data.get("dedicacion", actual["dedicacion"]))
+    fecha_desde   = data.get("fecha_desde", actual["fecha_desde"])
+    fecha_hasta   = data.get("fecha_hasta", actual["fecha_hasta"])
+    usuario_id    = data.get("usuario_id", actual["usuario_id"])
+    proyecto_id   = actual["proyecto_id"]
+
+    if not (0 <= dedicacion <= 100):
+        raise HTTPException(status_code=400, detail="La dedicación debe ser entre 0 y 100")
+    if fecha_desde > fecha_hasta:
+        raise HTTPException(status_code=400, detail="La fecha_desde no puede ser mayor a fecha_hasta")
+
+    if usuario_id != actual["usuario_id"]:
+        exist = await database.fetch_one('SELECT id FROM usuario WHERE id = :id', values={'id': usuario_id})
+        if not exist:
+            raise HTTPException(status_code=404, detail="Usuario no existe")
+
+    total = await database.fetch_one(
+        """
+        SELECT COALESCE(SUM(dedicacion), 0) AS total
+          FROM equipo
+         WHERE proyecto_id = :p
+           AND usuario_id  = :u
+           AND id <> :id
+           AND NOT (:hasta < fecha_desde OR :desde > fecha_hasta)
+        """,
+        values={'p': proyecto_id, 'u': usuario_id, 'id': equipo_id, 'desde': fecha_desde, 'hasta': fecha_hasta},
+    )
+    if float(total["total"]) + dedicacion > 100:
+        raise HTTPException(status_code=400, detail="La dedicación acumulada superaría 100% en el período")
+
+    row = await database.fetch_one(
+        """
+        UPDATE equipo
+           SET rol = :rol,
+               dedicacion = :dedicacion,
+               fecha_desde = :desde,
+               fecha_hasta = :hasta,
+               comentario = :comentario,
+               usuario_id = :usuario_id
+         WHERE id = :id
+        RETURNING id, proyecto_id, rol, dedicacion, fecha_desde, fecha_hasta, comentario, usuario_id
+        """,
+        values={
+            "id": equipo_id, "rol": rol, "dedicacion": dedicacion,
+            "desde": fecha_desde, "hasta": fecha_hasta,
+            "comentario": data.get("comentario", actual["comentario"]),
+            "usuario_id": usuario_id,
+        },
+    )
+    return dict(row)
+
+
+@app.delete("/equipos/{equipo_id}")
+async def eliminar_equipo(equipo_id: int):
+    r = await database.fetch_one("DELETE FROM equipo WHERE id = :id RETURNING id", values={"id": equipo_id})
+    if not r:
+        raise HTTPException(status_code=404, detail="Equipo no encontrado")
+    return {"mensaje": "Equipo eliminado"}
+
+
+
+# ======================
 # FACTURAS
 # ======================
 @app.post("/facturas/", response_model=FacturaOut)
-async def crear_factura(f: FacturaIn):
+async def crear_factura(f: FacturaIn, usuario_actual=Depends(obtener_usuario_actual)):
+    # proyecto existe?
+    proy = await database.fetch_one(
+        "SELECT id FROM proyecto WHERE id = :p AND rtrim(estado) <> 'ELIMINADO'",
+        values={"p": f.proyecto_id},
+    )
+    if not proy:
+        raise HTTPException(status_code=404, detail="Proyecto no existe o eliminado")
+
+    hito   = (f.hito or "").strip().upper()[:10]
+    estado = (f.estado or "").strip().upper()[:10]
+
     row = await database.fetch_one(
         """
-        INSERT INTO factura (proyecto_id, fecha, hito, estado, fecha_estado)
-        VALUES (:proyecto_id, :fecha, :hito, :estado, :fecha_estado)
-        RETURNING id, proyecto_id, fecha, hito, estado, fecha_estado
+        INSERT INTO factura (proyecto_id, fecha, hito, estado, fecha_estado, usuario_id)
+        VALUES (:proyecto_id, :fecha, :hito, :estado, :fecha_estado, :usuario_id)
+        RETURNING id, proyecto_id, fecha, rtrim(hito) AS hito, rtrim(estado) AS estado,
+                  fecha_estado, usuario_id
         """,
-        values=f.dict(),
+        values={
+            "proyecto_id": f.proyecto_id,
+            "fecha": f.fecha,
+            "hito": hito,
+            "estado": estado,
+            "fecha_estado": f.fecha_estado,
+            "usuario_id": usuario_actual["id"],  # o None si no quieres guardarlo
+        },
     )
     return dict(row)
 
 @app.get("/facturas/", response_model=list[FacturaOut])
-async def listar_facturas():
+async def listar_facturas(
+    proyecto_id: int | None = Query(None),
+    desde: date | None = Query(None),
+    hasta: date | None = Query(None),
+):
+    cond, vals = [], {}
+    if proyecto_id is not None:
+        cond.append("proyecto_id = :p"); vals["p"] = proyecto_id
+    if desde is not None:
+        cond.append("fecha >= :d"); vals["d"] = desde
+    if hasta is not None:
+        cond.append("fecha <= :h"); vals["h"] = hasta
+    where_sql = ("WHERE " + " AND ".join(cond)) if cond else ""
     rows = await database.fetch_all(
-        "SELECT id, proyecto_id, fecha, hito, estado, fecha_estado FROM factura ORDER BY fecha DESC, id DESC"
+        f"""SELECT id, proyecto_id, fecha, rtrim(hito) AS hito, rtrim(estado) AS estado,
+                   fecha_estado, usuario_id
+              FROM factura
+            {where_sql}
+          ORDER BY fecha DESC, id DESC"""
+        , values=vals
     )
     return [dict(r) for r in rows]
 
+@app.patch("/facturas/{factura_id}", response_model=FacturaOut)
+async def patch_factura(factura_id: int, body: dict = Body(...)):
+    allowed = {"fecha", "hito", "estado", "fecha_estado"}
+    data = {k: v for k, v in body.items() if k in allowed}
+    if not data:
+        raise HTTPException(400, "Nada para actualizar")
+    if "hito" in data and isinstance(data["hito"], str):
+        data["hito"] = data["hito"].strip().upper()[:10]
+    if "estado" in data and isinstance(data["estado"], str):
+        data["estado"] = data["estado"].strip().upper()[:10]
+
+    set_parts, vals = [], {"id": factura_id}
+    for k, v in data.items():
+        set_parts.append(f"{k} = :{k}")
+        vals[k] = v
+
+    row = await database.fetch_one(
+        f"""UPDATE factura
+               SET {", ".join(set_parts)}
+             WHERE id = :id
+         RETURNING id, proyecto_id, fecha, rtrim(hito) AS hito, rtrim(estado) AS estado,
+                   fecha_estado, usuario_id""",
+        values=vals
+    )
+    if not row:
+        raise HTTPException(404, "Factura no encontrada")
+    return dict(row)
+
+
 @app.delete("/facturas/{factura_id}")
 async def eliminar_factura(factura_id: int):
-    r = await database.fetch_one("DELETE FROM factura WHERE id = :id RETURNING id", values={"id": factura_id})
+    r = await database.fetch_one(
+        "DELETE FROM factura WHERE id = :id RETURNING id",
+        values={"id": factura_id},
+    )
     if not r:
         raise HTTPException(status_code=404, detail="Factura no encontrada")
     return {"mensaje": "Factura eliminada"}
+
 
 # ======================
 # DOCS (protegidos)
