@@ -4,8 +4,6 @@ from datetime import date, datetime, timedelta
 import os
 import bcrypt
 import databases
-from fastapi import FastAPI, HTTPException, Depends, Query, Body
-from fastapi.responses import JSONResponse, RedirectResponse   
 from fastapi import FastAPI, HTTPException, Depends, Request, Query, Body
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +15,7 @@ from pydantic import BaseModel, EmailStr, Field
 from jose import JWTError, jwt
 from dotenv import load_dotenv
 from authlib.integrations.starlette_client import OAuth
+
 
 # ======================
 # CONFIG
@@ -64,6 +63,10 @@ app.add_middleware(
 PROP_EST_COTIZ = "cotiz"   # Cotizada
 PROP_EST_ADJU  = "adju"    # Adjudicada
 PROP_EST_CANC  = "canc"    # Cancelada (nuevo)
+PROP_EST_ELIM  = "eliminado"
+
+ESTADOS_PROP = {PROP_EST_COTIZ, PROP_EST_ADJU, PROP_EST_CANC, PROP_EST_ELIM}
+
 
 # OAuth Microsoft (opcional)
 oauth = OAuth()
@@ -85,8 +88,12 @@ class UsuarioIn(BaseModel):
     email: EmailStr
     fono: str = Field(..., min_length=8, max_length=15)
 
-class UsuarioOut(UsuarioIn):
+class UsuarioOut(BaseModel):   # <-- sin password
     id: int
+    username: str
+    activo: bool
+    email: EmailStr
+    fono: str
 
 class PasswordChange(BaseModel):
     nueva_password: str = Field(..., min_length=6)
@@ -102,9 +109,10 @@ class PropuestaIn(BaseModel):
     cod_cliente: str
     nombre_propuesta: str
     sponsor: Optional[str] = None
-    tiempo_estimado: Optional[Union[str, float]] = None  
-    estado: str
+    tiempo_estimado: Optional[Union[str, float]] = None
+    estado: Optional[str] = None            # <— antes era str obligatorio
     usuario_id: Optional[int] = None
+
 
 class PropuestaOut(BaseModel):
     id: int
@@ -183,9 +191,33 @@ class ParametroIn(BaseModel):
 class ParametroOut(ParametroIn):
     id: int
 
+# ======================
+# HELPERS DE NORMALIZACIÓN
+# ======================
+def _norm_upper(s: Optional[str]) -> str:
+    return (s or "").strip().upper()
+
+def _norm_lower(s: Optional[str]) -> str:
+    return (s or "").strip().lower()
+
+def _page_params(page: int, page_size: int) -> tuple[int,int]:
+    page = max(1, page)
+    page_size = min(max(1, page_size), 200)  # límite 200 filas
+    return (page_size, (page - 1) * page_size)
+
 # ==========
 # HELPERS
 # ==========
+async def _advisory_lock_param(tipo: str, codigo: str):
+    """
+    Lock transaccional por (tipo,codigo) de parámetro para evitar duplicados
+    en escenarios concurrentes sin UNIQUE en BD.
+    No requiere crear índices ni modificar la base de datos.
+    """
+    key = f"PARAM|{(tipo or '').strip().upper()}|{(codigo or '').strip().upper()}"
+    sql = "SELECT pg_advisory_xact_lock(hashtextextended(:k, 0));"
+    await database.fetch_one(sql, values={"k": key})
+
 def build_nombre_auto(anio: str | None, tipo: str | None, correlativo: int | None, cod: str | None) -> str:
     a = (anio or "").strip()
     t = (tipo or "").strip().upper()
@@ -214,6 +246,19 @@ def parse_tiempo_half_steps(val: Optional[Union[str, float, int]]) -> Optional[f
     if round(f * 2) != f * 2:
         raise ValueError("El tiempo estimado debe ir en incrementos de 0.5")
     return f
+
+# ======================
+# HELPERS DE BLOQUEO
+# ======================
+async def _advisory_lock_param(tipo: str, codigo: str):
+    """
+    Lock transaccional por (tipo,codigo) de parámetro para evitar duplicados
+    en escenarios concurrentes sin UNIQUE en BD.
+    """
+    key = f"PARAM|{(tipo or '').strip().upper()}|{(codigo or '').strip().upper()}"
+    sql = "SELECT pg_advisory_xact_lock(hashtextextended(:k, 0));"
+    await database.fetch_one(sql, values={"k": key})
+
 # ======================
 # APP EVENTS
 # ======================
@@ -278,19 +323,18 @@ async def cambiar_password(datos: PasswordChange, usuario_actual=Depends(obtener
 @app.post("/usuarios/", response_model=UsuarioOut)
 async def crear_usuario(usuario: UsuarioIn):
     hashed = bcrypt.hashpw(usuario.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-    q = """
+    r = await database.fetch_one("""
         INSERT INTO usuario (username, password, activo, email, fono)
         VALUES (:username, :password, :activo, :email, :fono)
-        RETURNING id, username, password, activo, email, fono
-    """
-    values = {**usuario.dict(), "password": hashed}
-    r = await database.fetch_one(q, values=values)
+        RETURNING id, username, activo, email, fono
+    """, values={**usuario.dict(), "password": hashed})
     return {**dict(r), "fono": r["fono"].strip()}
 
 @app.get("/usuarios/", response_model=list[UsuarioOut])
 async def listar_usuarios(usuario_actual=Depends(obtener_usuario_actual)):
-    rows = await database.fetch_all("SELECT * FROM usuario")
+    rows = await database.fetch_all("SELECT id, username, activo, email, fono FROM usuario")
     return [{**dict(r), "fono": r["fono"].strip()} for r in rows]
+
 
 @app.delete("/usuarios/{usuario_id}")
 async def eliminar_usuario(usuario_id: int, usuario_actual=Depends(obtener_usuario_actual)):
@@ -306,13 +350,17 @@ async def eliminar_usuario(usuario_id: int, usuario_actual=Depends(obtener_usuar
 async def crear_propuesta(p: PropuestaIn):
     """
     Crea una propuesta con correlativo automático por (año, cliente).
-    Reglas claves:
-      - estado por defecto = COTIZADA (cotiz)
-      - tiempo_estimado en múltiplos de 0.5 (acepta '0,5')
-      - sponsor, cliente y tiempo son obligatorios
+
+    Reglas:
+      - estado por defecto = COTIZADA (PROP_EST_COTIZ = 'cotiz')
+      - sponsor, cliente y tiempo_estimado son OBLIGATORIOS
+      - tiempo_estimado debe venir en múltiplos de 0.5 (acepta '0,5')
+      - NO se permite crear directamente en estado 'eliminado'
     """
     try:
-        # Validaciones mínimas y normalizaciones
+        # -----------------------------
+        # Validaciones y normalización
+        # -----------------------------
         p_anio = (p.anio or "").strip()
         if len(p_anio) != 4 or not p_anio.isdigit():
             raise HTTPException(400, "El año debe tener 4 dígitos (ej: 2025)")
@@ -321,15 +369,25 @@ async def crear_propuesta(p: PropuestaIn):
         p_cod    = (p.cod_cliente or "").strip().upper()
         p_nombre = (p.nombre_propuesta or "").strip()
         p_spons  = (p.sponsor or "").strip()
-        p_estado = ((p.estado or PROP_EST_COTIZ).strip().lower())  # cat. 'prop_estado'
 
-        # Obligatorios (según requerimiento)
+        # Estado de catálogo (minúsculas) y bloqueo de 'eliminado'
+        p_estado = _norm_lower(p.estado or PROP_EST_COTIZ)
+        if p_estado not in ESTADOS_PROP:
+            raise HTTPException(400, "Estado inválido. Usa: cotiz | adju | canc | eliminado")
+        if p_estado == PROP_EST_ELIM:
+            raise HTTPException(400, "No puedes crear propuestas directamente en ELIMINADO")
+
+        # Obligatoriedades
         if not p_cod:
-            raise HTTPException(400, "El cliente es obligatorio")
+            raise HTTPException(400, "El código de cliente es obligatorio")
         if not p_spons:
             raise HTTPException(400, "El sponsor es obligatorio")
+        if not p_nombre:
+            raise HTTPException(400, "El nombre de la propuesta es obligatorio")
+        if p.usuario_id is None or p.usuario_id <= 0:
+            raise HTTPException(400, "El usuario_id es obligatorio y debe ser mayor que cero")
 
-        # tiempo_estimado: múltiplos de 0.5
+        # tiempo_estimado: múltiplos de 0.5 (acepta coma)
         try:
             t_est = parse_tiempo_half_steps(p.tiempo_estimado)
         except ValueError as ve:
@@ -337,11 +395,11 @@ async def crear_propuesta(p: PropuestaIn):
         if t_est is None:
             raise HTTPException(400, "El tiempo estimado es obligatorio")
 
+
         async with database.transaction():
-            # Lock estable para no duplicar correlativos simultáneos
+            
             await _advisory_lock_por_anio_cliente(p_anio, p_cod)
 
-            # siguiente correlativo por (año, cliente)
             row_next = await database.fetch_one(
                 """
                 SELECT COALESCE(MAX(correlativo), 0) + 1 AS next
@@ -353,6 +411,7 @@ async def crear_propuesta(p: PropuestaIn):
             )
             correlativo = int(row_next["next"])
 
+            # Insertar
             row = await database.fetch_one(
                 """
                 INSERT INTO propuesta
@@ -388,7 +447,7 @@ async def crear_propuesta(p: PropuestaIn):
             )
 
         d = dict(row)
-        d["eliminado"]   = (d["estado"].upper() == "ELIMINADO")
+        d["eliminado"] = ((d.get("estado") or "").strip().upper() == "ELIMINADO")
         d["nombre_auto"] = build_nombre_auto(d["anio"], d["tipo"], d["correlativo"], d["cod_cliente"])
         return d
 
@@ -398,65 +457,30 @@ async def crear_propuesta(p: PropuestaIn):
         print("crear_propuesta error:", repr(e))
         raise HTTPException(400, f"Error al crear propuesta: {e}")
 
-@app.get("/propuestas/elegibles", response_model=list[PropuestaOut])
-async def listar_propuestas_elegibles():
-    """
-    Devuelve propuestas ADJUDICADAS y NO tomadas por otro proyecto,
-    y que no estén eliminadas.
-    """
-    rows = await database.fetch_all(
-        """
-        SELECT
-          p.id,
-          RTRIM(p."año")        AS anio,
-          RTRIM(p.tipo)         AS tipo,
-          p.correlativo         AS correlativo,
-          RTRIM(p.cod_cliente)  AS cod_cliente,
-          p.nombre_propuesta    AS nombre_propuesta,
-          RTRIM(p.estado)       AS estado,
-          p.fecha_estado        AS fecha_estado,
-          COALESCE(p.usuario_id, 0) AS usuario_id,
-          COALESCE(p.eliminado, FALSE) AS eliminado
-        FROM propuesta p
-        WHERE COALESCE(p.eliminado, FALSE) = FALSE
-          AND RTRIM(LOWER(p.estado)) = :adju
-          AND NOT EXISTS (
-                SELECT 1
-                  FROM proyecto pr
-                 WHERE pr.propuesta_id = p.id
-                   AND RTRIM(UPPER(pr.estado)) <> 'ELIMINADO'
-          )
-        ORDER BY p.id DESC
-        """,
-        values={"adju": PROP_EST_ADJU},
-    )
-
-    out = []
-    for r in rows:
-        d = dict(r)
-        d["nombre_auto"] = build_nombre_auto(d["anio"], d["tipo"], d["correlativo"], d["cod_cliente"])
-        out.append(d)
-    return out
-
 @app.get("/propuestas/", response_model=list[PropuestaOut])
 async def listar_propuestas(
     incluir_eliminado: bool = Query(False),
     solo_disponibles: bool = Query(False),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
 ):
     filtros = []
     vals: dict = {}
 
     if not incluir_eliminado:
-        filtros.append("COALESCE(p.eliminado, FALSE) = FALSE")
+        filtros.append("COALESCE(RTRIM(UPPER(p.estado)),'') <> 'ELIMINADO'")
 
-    # Si piden solo adjudicadas y libres (sin proyecto asociado)
     if solo_disponibles:
-        filtros.append("RTRIM(UPPER(p.estado)) = 'ADJUDICADA'")
+        filtros.append("RTRIM(LOWER(COALESCE(p.estado,''))) = :adju")
+        vals["adju"] = PROP_EST_ADJU
         filtros.append(
-            "NOT EXISTS (SELECT 1 FROM proyecto pr WHERE pr.propuesta_id = p.id)"
+            "NOT EXISTS (SELECT 1 FROM proyecto pr "
+            "            WHERE pr.propuesta_id = p.id "
+            "              AND COALESCE(RTRIM(UPPER(pr.estado)),'') <> 'ELIMINADO')"
         )
 
     where_sql = ("WHERE " + " AND ".join(filtros)) if filtros else ""
+    limit, offset = _page_params(page, page_size)
 
     q = f"""
         SELECT
@@ -466,114 +490,84 @@ async def listar_propuestas(
           p.correlativo         AS correlativo,
           RTRIM(p.cod_cliente)  AS cod_cliente,
           p.nombre_propuesta    AS nombre_propuesta,
-          RTRIM(p.estado)       AS estado,
+          RTRIM(COALESCE(p.estado,'')) AS estado,
           p.fecha_estado        AS fecha_estado,
-          COALESCE(p.usuario_id, 0) AS usuario_id,
-          COALESCE(p.eliminado, FALSE) AS eliminado
+          COALESCE(p.usuario_id, 0) AS usuario_id
         FROM propuesta p
         {where_sql}
         ORDER BY p.id DESC
+        LIMIT :limit OFFSET :offset
     """
-    rows = await database.fetch_all(q, values=vals)
+    rows = await database.fetch_all(q, values={**vals, "limit": limit, "offset": offset})
     out = []
     for r in rows:
         d = dict(r)
-        # si quieres enviar nombre_auto desde back (opcional)
+        d["eliminado"] = ((d.get("estado") or "").strip().upper() == "ELIMINADO")
         d["nombre_auto"] = build_nombre_auto(d["anio"], d["tipo"], d["correlativo"], d["cod_cliente"])
         out.append(d)
     return out
 
-@app.patch("/propuestas/{propuesta_id}", response_model=PropuestaOut)
-async def patch_propuesta(propuesta_id: int, body: dict = Body(...)):
-    allowed = {
-        "anio", "tipo", "correlativo", "cod_cliente", "nombre_propuesta",
-        "sponsor", "tiempo_estimado", "estado", "usuario_id"
-    }
-    data = {k: v for k, v in body.items() if k in allowed}
-    if not data:
-        raise HTTPException(status_code=400, detail="Nada para actualizar")
-
-    # normalizaciones
-    if "estado" in data and isinstance(data["estado"], str):
-        data["estado"] = data["estado"].strip().upper()
-    if "tipo" in data and isinstance(data["tipo"], str):
-        data["tipo"] = data["tipo"].strip().upper()
-    if "cod_cliente" in data and isinstance(data["cod_cliente"], str):
-        data["cod_cliente"] = data["cod_cliente"].strip().upper()
-    if "nombre_propuesta" in data and isinstance(data["nombre_propuesta"], str):
-        data["nombre_propuesta"] = data["nombre_propuesta"].strip()
-    if "tiempo_estimado" in data:
-        data["tiempo_estimado"] = parse_tiempo_half_steps(data["tiempo_estimado"])
-
-    # Trae actual para comparar
-    actual = await database.fetch_one(
+@app.get("/propuestas/elegibles", response_model=list[PropuestaOut])
+async def listar_propuestas_elegibles():
+    rows = await database.fetch_all(
         """
-        SELECT rtrim("año") AS anio, rtrim(tipo) AS tipo, correlativo, rtrim(cod_cliente) AS cod_cliente
-          FROM propuesta
-         WHERE id = :id
+        SELECT
+          p.id,
+          RTRIM(p."año")        AS anio,
+          RTRIM(p.tipo)         AS tipo,
+          p.correlativo         AS correlativo,
+          RTRIM(p.cod_cliente)  AS cod_cliente,
+          p.nombre_propuesta    AS nombre_propuesta,
+          RTRIM(COALESCE(p.estado, '')) AS estado,
+          p.fecha_estado        AS fecha_estado,
+          COALESCE(p.usuario_id, 0) AS usuario_id
+        FROM propuesta p
+        WHERE RTRIM(LOWER(COALESCE(p.estado,''))) = :adju
+          AND NOT EXISTS (
+                SELECT 1
+                  FROM proyecto pr
+                 WHERE pr.propuesta_id = p.id
+                   AND RTRIM(UPPER(COALESCE(pr.estado,''))) <> 'ELIMINADO'
+          )
+        ORDER BY p.id DESC
         """,
-        values={"id": propuesta_id},
+        values={"adju": PROP_EST_ADJU},
     )
-    if not actual:
-        raise HTTPException(status_code=404, detail="Propuesta no encontrada")
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["eliminado"] = ((d.get("estado") or "").strip().upper() == "ELIMINADO")
+        d["nombre_auto"] = build_nombre_auto(d["anio"], d["tipo"], d["correlativo"], d["cod_cliente"])
+        out.append(d)
+    return out
 
-    nuevo_anio = data.get("anio", actual["anio"])
-    nuevo_cod  = data.get("cod_cliente", actual["cod_cliente"])
-
-    async with database.transaction():
-        # Si cambian (anio o cod_cliente) y NO mandaron correlativo, recalcúlalo automáticamente
-        if (("anio" in data) or ("cod_cliente" in data)) and ("correlativo" not in data):
-            await _advisory_lock_por_anio_cliente(nuevo_anio, nuevo_cod)
-            row_next = await database.fetch_one(
-                """
-                SELECT COALESCE(MAX(correlativo), 0) + 1 AS next
-                  FROM propuesta
-                 WHERE rtrim("año") = :anio
-                   AND rtrim(cod_cliente) = :cod
-                """,
-                values={"anio": nuevo_anio, "cod": nuevo_cod},
-            )
-            data["correlativo"] = int(row_next["next"])
-
-        # Construye UPDATE dinámico
-        set_parts, vals = [], {"id": propuesta_id}
-        for k, v in data.items():
-            if k == "anio":
-                set_parts.append('"año" = :anio'); vals["anio"] = v
-            else:
-                set_parts.append(f"{k} = :{k}"); vals[k] = v
-        if "estado" in data and "fecha_estado" not in data:
-            set_parts.append("fecha_estado = CURRENT_DATE")
-
-        row = await database.fetch_one(
-            f"""
-            UPDATE propuesta
-               SET {", ".join(set_parts)}
-             WHERE id = :id
-            RETURNING
-              id, rtrim("año") AS anio, rtrim(tipo) AS tipo, correlativo,
-              rtrim(cod_cliente) AS cod_cliente, nombre_propuesta, sponsor,
-              tiempo_estimado, rtrim(estado) AS estado, fecha_estado, usuario_id
-            """,
-            values=vals,
-        )
-
-    d = dict(row)
-    d["eliminado"]  = (d["estado"] == "ELIMINADO")
-    d["nombre_auto"] = build_nombre_auto(d["anio"], d["tipo"], d["correlativo"], d["cod_cliente"])
-    return d
 
 @app.delete("/propuestas/{propuesta_id}")
 async def eliminar_propuesta(propuesta_id: int):
+
+    tomada = await database.fetch_one("""
+        SELECT 1
+          FROM proyecto pr
+         WHERE pr.propuesta_id = :pid
+           AND COALESCE(RTRIM(UPPER(pr.estado)),'') <> 'ELIMINADO'
+         LIMIT 1
+    """, values={"pid": propuesta_id})
+    if tomada:
+        raise HTTPException(409, "No se puede eliminar: la propuesta tiene un proyecto activo")
+
+    # 2. Elimina lógicamente
     r = await database.fetch_one("""
         UPDATE propuesta
-           SET estado = 'ELIMINADO', fecha_estado = CURRENT_DATE
-         WHERE id = :id AND rtrim(estado) <> 'ELIMINADO'
+           SET estado = 'ELIMINADO',
+               fecha_estado = CURRENT_DATE
+         WHERE id = :id
+           AND COALESCE(RTRIM(UPPER(estado)),'') <> 'ELIMINADO'
      RETURNING id
     """, values={"id": propuesta_id})
     if not r:
         raise HTTPException(status_code=404, detail="Propuesta no encontrada o ya eliminada")
-    return {"mensaje": "Propuesta eliminada"}
+    return {"mensaje": "Propuesta eliminada correctamente"}
+
 
 async def _advisory_lock_por_anio_cliente(anio: str, cod: str):
     """
@@ -590,50 +584,139 @@ async def _advisory_lock_por_anio_cliente(anio: str, cod: str):
 # ======================
 # PARÁMETROS
 # ======================
+async def _parametro_existe(tipo: str, codigo: str, exclude_id: int | None = None) -> bool:
+    """
+    Valida duplicados de forma *insensible a mayúsculas* y
+    ignorando espacios a la derecha (legacy).
+    """
+    q = """
+        SELECT 1
+          FROM parametro
+         WHERE UPPER(rtrim(tipo))   = UPPER(:tipo)
+           AND UPPER(rtrim(codigo)) = UPPER(:codigo)
+    """
+    vals = {"tipo": (tipo or "").strip(), "codigo": (codigo or "").strip()}
+    if exclude_id is not None:
+        q += " AND id <> :id"
+        vals["id"] = exclude_id
+    row = await database.fetch_one(q, values=vals)
+    return row is not None
+
+
 @app.get("/parametros/{tipo}")
-async def listar_parametros(tipo: str):
-    rows = await database.fetch_all(
-        """
+async def listar_parametros(
+    tipo: str,
+    q: str | None = Query(None, description="buscar en código o valor"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=500),
+):
+    """
+    Lista parámetros por tipo, con búsqueda opcional y paginación.
+    La búsqueda ignora mayúsculas y considera rtrim en 'codigo' y 'valor'.
+    """
+    limit = min(max(1, page_size), 500)
+    offset = (max(1, page) - 1) * limit
+
+    base = """
         SELECT rtrim(codigo) AS codigo, valor
           FROM parametro
-         WHERE rtrim(tipo) = :tipo
-         ORDER BY valor
-        """,
-        values={"tipo": tipo},
-    )
+         WHERE UPPER(rtrim(tipo)) = UPPER(:tipo)
+    """
+    vals = {"tipo": (tipo or "").strip()}
+    if q:
+        base += " AND (UPPER(rtrim(codigo)) LIKE :w OR UPPER(rtrim(valor)) LIKE :w)"
+        vals["w"] = f"%{q.strip().upper()}%"
+
+    base += " ORDER BY valor LIMIT :limit OFFSET :offset"
+    rows = await database.fetch_all(base, values={**vals, "limit": limit, "offset": offset})
     return [{"codigo": r["codigo"], "valor": r["valor"]} for r in rows]
+
 
 @app.post("/parametros/", response_model=ParametroOut)
 async def crear_parametro(p: ParametroIn, usuario_actual=Depends(obtener_usuario_actual)):
-    try:
+    tipo   = (p.tipo or "").strip()
+    codigo = (p.codigo or "").strip().upper()
+    valor  = (p.valor or "").strip()
+
+    if not tipo or not codigo or not valor:
+        raise HTTPException(400, "tipo, codigo y valor son obligatorios")
+
+    # --- BD: lock + transacción (sin índices/constraints nuevos)
+    async with database.transaction():
+        await _advisory_lock_param(tipo, codigo)        # evita carrera
+        if await _parametro_existe(tipo, codigo):
+            raise HTTPException(409, f"Ya existe un parámetro con tipo '{tipo}' y código '{codigo}'")
+
         row = await database.fetch_one("""
             INSERT INTO parametro (tipo, codigo, valor, usuario_id)
             VALUES (:tipo, :codigo, :valor, :uid)
             RETURNING id, rtrim(tipo) AS tipo, rtrim(codigo) AS codigo, valor
-        """, values={**p.dict(), "uid": usuario_actual["id"]})
-        return dict(row)
-    except Exception as e:
-        # si tienes unique(tipo,codigo) esto atrapará duplicados
-        raise HTTPException(400, detail=f"No se pudo crear el parámetro: {e}")
+        """, values={"tipo": tipo, "codigo": codigo, "valor": valor, "uid": usuario_actual["id"]})
+
+    return dict(row)
+
+
 
 @app.patch("/parametros/{id}", response_model=ParametroOut)
 async def actualizar_parametro(id: int, p: ParametroIn, usuario_actual=Depends(obtener_usuario_actual)):
-    row = await database.fetch_one("""
-        UPDATE parametro
-           SET tipo = :tipo, codigo = :codigo, valor = :valor, usuario_id = :uid
-         WHERE id = :id
-     RETURNING id, rtrim(tipo) AS tipo, rtrim(codigo) AS codigo, valor
-    """, values={**p.dict(), "uid": usuario_actual["id"], "id": id})
-    if not row:
-        raise HTTPException(404, detail="Parámetro no encontrado")
+    tipo_n   = (p.tipo or "").strip()
+    codigo_n = (p.codigo or "").strip().upper()
+    valor_n  = (p.valor or "").strip()
+
+    if not tipo_n or not codigo_n or not valor_n:
+        raise HTTPException(400, "tipo, codigo y valor son obligatorios")
+
+    actual = await database.fetch_one("SELECT rtrim(tipo) AS tipo, rtrim(codigo) AS codigo FROM parametro WHERE id = :id",
+                                      values={"id": id})
+    if not actual:
+        raise HTTPException(404, "Parámetro no encontrado")
+
+    cambia_pk = (actual["tipo"].strip() != tipo_n) or (actual["codigo"].strip().upper() != codigo_n)
+
+    async with database.transaction():
+        if cambia_pk:
+            await _advisory_lock_param(tipo_n, codigo_n)
+            if await _parametro_existe(tipo_n, codigo_n, exclude_id=id):
+                raise HTTPException(409, f"Ya existe un parámetro con tipo '{tipo_n}' y código '{codigo_n}'")
+        else:
+            # aunque no cambie (tipo,codigo), ver si hay otro duplicado (por seguridad)
+            if await _parametro_existe(tipo_n, codigo_n, exclude_id=id):
+                raise HTTPException(409, f"Ya existe un parámetro con tipo '{tipo_n}' y código '{codigo_n}'")
+
+        row = await database.fetch_one("""
+            UPDATE parametro
+               SET tipo = :tipo, codigo = :codigo, valor = :valor, usuario_id = :uid
+             WHERE id = :id
+         RETURNING id, rtrim(tipo) AS tipo, rtrim(codigo) AS codigo, valor
+        """, values={"tipo": tipo_n, "codigo": codigo_n, "valor": valor_n, "uid": usuario_actual["id"], "id": id})
+
     return dict(row)
+
+
 
 @app.delete("/parametros/{id}")
 async def eliminar_parametro(id: int, usuario_actual=Depends(obtener_usuario_actual)):
-    row = await database.fetch_one("DELETE FROM parametro WHERE id = :id RETURNING id", values={"id": id})
-    if not row:
-        raise HTTPException(404, detail="Parámetro no encontrado")
-    return {"ok": True}
+    """
+    Elimina un parámetro por id.
+    """
+    r = await database.fetch_one("DELETE FROM parametro WHERE id = :id RETURNING id", values={"id": id})
+    if not r:
+        raise HTTPException(404, "Parámetro no encontrado")
+    return {"mensaje": "Parámetro eliminado"}
+
+
+@app.get("/parametros-tipos")
+async def listar_tipos_parametros():
+    """
+    Devuelve la lista de tipos distintos (normalizados con rtrim), ordenados alfabéticamente.
+    """
+    rows = await database.fetch_all("""
+        SELECT DISTINCT rtrim(tipo) AS tipo
+          FROM parametro
+         ORDER BY tipo
+    """)
+    return [r["tipo"] for r in rows]
+
 
 # ======================
 # PROYECTOS
@@ -647,8 +730,15 @@ async def crear_proyecto(p: ProyectoIn):
       - existe
       - está ADJUDICADA (prop_estado = 'adju')
       - no tiene otro proyecto activo (no eliminado)
+    Además:
+      - valida fecha_inicio <= fecha_termino
+      - normaliza tipo_facturacion y estado a UPPER
     """
-    # 1) Propuesta existe y está adjudicada
+    # 0) Validación básica de fechas
+    if p.fecha_inicio > p.fecha_termino:
+        raise HTTPException(400, "La fecha_inicio no puede ser mayor que fecha_termino")
+
+    # 1) Propuesta existe
     prop = await database.fetch_one(
         """
         SELECT
@@ -666,10 +756,11 @@ async def crear_proyecto(p: ProyectoIn):
     if not prop:
         raise HTTPException(404, "Propuesta no encontrada")
 
+    # 2) Propuesta debe estar ADJUDICADA (código 'adju' del catálogo)
     if (prop["estado"] or "").strip().lower() != PROP_EST_ADJU:
         raise HTTPException(400, "La propuesta debe estar ADJUDICADA para crear un proyecto")
 
-    # 2) Asegurar que no esté tomada por otro proyecto
+    # 3) Asegurar que no esté tomada por otro proyecto activo (no ELIMINADO)
     taken = await database.fetch_one(
         """
         SELECT 1
@@ -683,7 +774,7 @@ async def crear_proyecto(p: ProyectoIn):
     if taken:
         raise HTTPException(409, "La propuesta ya está asociada a otro proyecto activo")
 
-    # 3) Insertar proyecto
+    # 4) Insertar proyecto (normalizando códigos)
     ins = await database.fetch_one(
         """
         INSERT INTO proyecto
@@ -705,7 +796,7 @@ async def crear_proyecto(p: ProyectoIn):
         },
     )
 
-    # 4) Devolver con datos compuestos (nombre_auto, etc.)
+    # 5) Devolver con datos compuestos (incluye nombre_auto)
     row = await database.fetch_one(
         """
         SELECT
@@ -729,6 +820,10 @@ async def crear_proyecto(p: ProyectoIn):
         """,
         values={"id": ins["id"]},
     )
+    if not row:
+        # muy raro que falle aquí, pero por si acaso
+        raise HTTPException(500, "Error al recuperar el proyecto recién creado")
+
     d = dict(row)
     d["nombre_auto"] = build_nombre_auto(d["anio"], d["tipo"], d["correlativo"], d["cod_cliente"])
     for k in ("tipo", "correlativo", "cod_cliente"):
@@ -1141,22 +1236,29 @@ async def _validar_equipo_basico(e: EquipoIn | dict, equipo_id: int | None = Non
 
 @app.post("/equipos/", response_model=EquipoOut)
 async def crear_equipo(e: EquipoIn, usuario_actual=Depends(obtener_usuario_actual)):
+    # Validaciones básicas
     if not (0 <= e.dedicacion <= 100):
-        raise HTTPException(status_code=400, detail="La dedicación debe ser entre 0 y 100")
+        raise HTTPException(400, "La dedicación debe ser entre 0 y 100")
     if e.fecha_desde > e.fecha_hasta:
-        raise HTTPException(status_code=400, detail="La fecha_desde no puede ser mayor a fecha_hasta")
+        raise HTTPException(400, "La fecha_desde no puede ser mayor a fecha_hasta")
 
+    # Proyecto válido y activo (no eliminado)
     proy = await database.fetch_one(
-        'SELECT id FROM proyecto WHERE id = :id AND rtrim(estado) <> \'ELIMINADO\'',
-        values={'id': e.proyecto_id},
+        "SELECT id FROM proyecto WHERE id = :id AND RTRIM(estado) <> 'ELIMINADO'",
+        values={"id": e.proyecto_id},
     )
     if not proy:
-        raise HTTPException(status_code=404, detail="Proyecto no existe o está eliminado")
+        raise HTTPException(404, "Proyecto no existe o está eliminado")
 
-    usu = await database.fetch_one('SELECT id FROM usuario WHERE id = :id', values={'id': e.usuario_id})
+    # Usuario válido
+    usu = await database.fetch_one(
+        "SELECT id FROM usuario WHERE id = :id",
+        values={"id": e.usuario_id},
+    )
     if not usu:
-        raise HTTPException(status_code=404, detail="Usuario no existe")
+        raise HTTPException(404, "Usuario no existe")
 
+    # Chequeo de solapamientos dentro del mismo proyecto para ese usuario
     total = await database.fetch_one(
         """
         SELECT COALESCE(SUM(dedicacion), 0) AS total
@@ -1165,11 +1267,17 @@ async def crear_equipo(e: EquipoIn, usuario_actual=Depends(obtener_usuario_actua
            AND usuario_id  = :u
            AND NOT (:hasta < fecha_desde OR :desde > fecha_hasta)
         """,
-        values={'p': e.proyecto_id, 'u': e.usuario_id, 'desde': e.fecha_desde, 'hasta': e.fecha_hasta},
+        values={
+            "p": e.proyecto_id,
+            "u": e.usuario_id,
+            "desde": e.fecha_desde,
+            "hasta": e.fecha_hasta,
+        },
     )
-    if float(total["total"]) + e.dedicacion > 100:
-        raise HTTPException(status_code=400, detail="La dedicación acumulada superaría 100% en el período")
+    if float(total["total"] or 0) + float(e.dedicacion) > 100:
+        raise HTTPException(400, "La dedicación acumulada superaría 100% en el período")
 
+    # Inserción
     row = await database.fetch_one(
         """
         INSERT INTO equipo (proyecto_id, rol, dedicacion, fecha_desde, fecha_hasta, comentario, usuario_id)
@@ -1197,32 +1305,51 @@ async def listar_equipos(proyecto_id: int = Query(...)):
 
 @app.patch("/equipos/{equipo_id}", response_model=EquipoOut)
 async def patch_equipo(equipo_id: int, body: dict = Body(...)):
-    allowed = {"rol","dedicacion","fecha_desde","fecha_hasta","comentario","usuario_id"}
+    allowed = {"rol", "dedicacion", "fecha_desde", "fecha_hasta", "comentario", "usuario_id"}
     data = {k: v for k, v in body.items() if k in allowed}
     if not data:
-        raise HTTPException(status_code=400, detail="Nada para actualizar")
+        raise HTTPException(400, "Nada para actualizar")
 
+    # Registro actual
     actual = await database.fetch_one("SELECT * FROM equipo WHERE id = :id", values={"id": equipo_id})
     if not actual:
-        raise HTTPException(status_code=404, detail="Equipo no encontrado")
+        raise HTTPException(404, "Equipo no encontrado")
 
-    rol           = data.get("rol", actual["rol"])
-    dedicacion    = float(data.get("dedicacion", actual["dedicacion"]))
-    fecha_desde   = data.get("fecha_desde", actual["fecha_desde"])
-    fecha_hasta   = data.get("fecha_hasta", actual["fecha_hasta"])
-    usuario_id    = data.get("usuario_id", actual["usuario_id"])
-    proyecto_id   = actual["proyecto_id"]
+    # Normalizaciones y defaults
+    rol         = data.get("rol", actual["rol"])
+    dedicacion  = float(data.get("dedicacion", actual["dedicacion"]))
+    fecha_desde = data.get("fecha_desde", actual["fecha_desde"])
+    fecha_hasta = data.get("fecha_hasta", actual["fecha_hasta"])
+    usuario_id  = data.get("usuario_id", actual["usuario_id"])
+    proyecto_id = actual["proyecto_id"]
 
+    # Si las fechas vienen como string ISO, conviértelas a date
+    if isinstance(fecha_desde, str):
+        fecha_desde = date.fromisoformat(fecha_desde)
+    if isinstance(fecha_hasta, str):
+        fecha_hasta = date.fromisoformat(fecha_hasta)
+
+    # Validaciones básicas
     if not (0 <= dedicacion <= 100):
-        raise HTTPException(status_code=400, detail="La dedicación debe ser entre 0 y 100")
+        raise HTTPException(400, "La dedicación debe ser entre 0 y 100")
     if fecha_desde > fecha_hasta:
-        raise HTTPException(status_code=400, detail="La fecha_desde no puede ser mayor a fecha_hasta")
+        raise HTTPException(400, "La fecha_desde no puede ser mayor a fecha_hasta")
 
+    # Verificar que el proyecto sigue activo (no eliminado)
+    proy = await database.fetch_one(
+        "SELECT id FROM proyecto WHERE id = :id AND RTRIM(estado) <> 'ELIMINADO'",
+        values={"id": proyecto_id},
+    )
+    if not proy:
+        raise HTTPException(409, "No se puede modificar: el proyecto está eliminado o no existe")
+
+    # Si cambió el usuario, validar que exista
     if usuario_id != actual["usuario_id"]:
-        exist = await database.fetch_one('SELECT id FROM usuario WHERE id = :id', values={'id': usuario_id})
+        exist = await database.fetch_one("SELECT id FROM usuario WHERE id = :id", values={"id": usuario_id})
         if not exist:
-            raise HTTPException(status_code=404, detail="Usuario no existe")
+            raise HTTPException(404, "Usuario no existe")
 
+    # Chequeo de solapamientos dentro del mismo proyecto para ese usuario (excluyendo este registro)
     total = await database.fetch_one(
         """
         SELECT COALESCE(SUM(dedicacion), 0) AS total
@@ -1232,11 +1359,18 @@ async def patch_equipo(equipo_id: int, body: dict = Body(...)):
            AND id <> :id
            AND NOT (:hasta < fecha_desde OR :desde > fecha_hasta)
         """,
-        values={'p': proyecto_id, 'u': usuario_id, 'id': equipo_id, 'desde': fecha_desde, 'hasta': fecha_hasta},
+        values={
+            "p": proyecto_id,
+            "u": usuario_id,
+            "id": equipo_id,
+            "desde": fecha_desde,
+            "hasta": fecha_hasta,
+        },
     )
-    if float(total["total"]) + dedicacion > 100:
-        raise HTTPException(status_code=400, detail="La dedicación acumulada superaría 100% en el período")
+    if float(total["total"] or 0) + float(dedicacion) > 100:
+        raise HTTPException(400, "La dedicación acumulada superaría 100% en el período")
 
+    # Actualización
     row = await database.fetch_one(
         """
         UPDATE equipo
@@ -1250,13 +1384,17 @@ async def patch_equipo(equipo_id: int, body: dict = Body(...)):
         RETURNING id, proyecto_id, rol, dedicacion, fecha_desde, fecha_hasta, comentario, usuario_id
         """,
         values={
-            "id": equipo_id, "rol": rol, "dedicacion": dedicacion,
-            "desde": fecha_desde, "hasta": fecha_hasta,
+            "id": equipo_id,
+            "rol": rol,
+            "dedicacion": dedicacion,
+            "desde": fecha_desde,
+            "hasta": fecha_hasta,
             "comentario": data.get("comentario", actual["comentario"]),
             "usuario_id": usuario_id,
         },
     )
     return dict(row)
+
 
 @app.delete("/equipos/{equipo_id}")
 async def eliminar_equipo(equipo_id: int):
