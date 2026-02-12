@@ -56,7 +56,8 @@ EST_PROP_APP2DB = {
     "adju": "ADJ",
     "canc": "CAN",
     "eliminado": "ELI",
-    "anul" : "ANUL"
+    "anul" : "ANUL",
+    "confeccion": "CONF",
 }
 EST_PROP_DB2APP = {v: k for k, v in EST_PROP_APP2DB.items()}
 # ======================
@@ -321,9 +322,22 @@ def parse_tiempo_half_steps(val: Optional[Union[str, float, int]]) -> Optional[f
     return f
 
 async def _advisory_lock_por_anio_cliente(anio: str, cod: str):
+    """
+    Lock por año+cliente (se mantiene por compatibilidad si lo usas en otros lados).
+    """
     key = f"{int(anio):04d}|{cod.strip().upper()}"
     sql = "SELECT pg_advisory_xact_lock(hashtextextended(:k, 0));"
     await database.fetch_one(sql, values={"k": key})
+
+
+async def _advisory_lock_por_anio_cliente_tipo(anio: str, cod: str, tipo: str):
+    """
+    Lock por año+cliente+tipo (NECESARIO para correlativos independientes por tipo).
+    """
+    key = f"{int(anio):04d}|{cod.strip().upper()}|{(tipo or '').strip().upper()}"
+    sql = "SELECT pg_advisory_xact_lock(hashtextextended(:k, 0));"
+    await database.fetch_one(sql, values={"k": key})
+
 
 async def _advisory_lock_param(tipo: str, codigo: str):
     key = f"PARAM|{(tipo or '').strip().upper()}|{(codigo or '').strip().upper()}"
@@ -407,6 +421,17 @@ async def _parametro_usuario_delete(user_id: int):
            AND TRIM(codigo)=:codigo
     """, {"codigo": _pad5(user_id)})
 
+def _norm_role(r: str) -> str:
+    return (r or "").strip().upper().replace(" ", "_")
+
+def _is_admin(roles: list[str]) -> bool:
+    roles_norm = {_norm_role(r) for r in (roles or [])}
+    return "ADMIN" in roles_norm or "ADMINISTRADOR" in roles_norm
+
+def _is_jefe_proyecto(roles: list[str]) -> bool:
+    roles_norm = {_norm_role(r) for r in (roles or [])}
+    return "JEFE_PROYECTO" in roles_norm or "JEFE_DE_PROYECTO" in roles_norm
+
 
 # ======================
 # APP EVENTS
@@ -440,7 +465,14 @@ async def obtener_usuario_actual(token: str = Depends(oauth2_scheme)):
     )
     if user is None or not user["activo"]:
         raise HTTPException(status_code=401, detail="Usuario no autorizado")
-    return dict(user)
+
+    u = dict(user)
+
+    # ✅ agregar roles al dict del usuario
+    roles = await obtener_roles_usuario(u["id"])   # esto ya lo tienes creado
+    u["roles"] = list(roles)  # set -> list para JSON/iteraciones
+
+    return u
 
 async def obtener_roles_usuario(usuario_id: int):
     query = """
@@ -479,9 +511,15 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     if not verify_password(form_data.password, user["password"]):
         raise HTTPException(status_code=401, detail="Contraseña incorrecta")
 
+    roles = await obtener_roles_usuario(user["id"])  # <- ya existe en tu archivo
+
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     token = jwt.encode(
-        {"sub": user["username"], "exp": expire},
+        {
+            "sub": user["username"],
+            "exp": expire,
+            "roles": list(roles),  # ✅ clave
+        },
         SECRET_KEY,
         algorithm=ALGORITHM
     )
@@ -613,7 +651,7 @@ async def crear_propuesta(
 ):
     roles = seguridad["roles"]
 
-    if "JEFE PROYECTO" in roles and "ADMINISTRADOR" not in roles:
+    if "JEFE_PROYECTO" in roles and "ADMINISTRADOR" not in roles:
         raise HTTPException(
             status_code=403,
             detail="No tiene permisos para crear propuestas",
@@ -633,17 +671,14 @@ async def crear_propuesta(
         # ==========================
         # ESTADO: usar lo que viene del front
         # ==========================
-        # p.estado viene como: 'cotiz' | 'adju' | 'canc' | 'eliminado'
-        # si no viene nada, dejamos 'cotiz' por defecto
         est_app = _norm_lower(p.estado) or "cotiz"
 
         if est_app not in EST_PROP_APP2DB:
             raise HTTPException(
                 400,
-                "Estado inválido. Usa: cotiz | adju | canc | eliminado",
+                "Estado inválido. Usa: cotiz | adju | canc | eliminado | confeccion | anul",
             )
 
-        # valor que se guarda en BD: COT / ADJ / CAN / ELI
         p_estado_db = EST_PROP_APP2DB[est_app]
 
         # ==========================
@@ -651,6 +686,8 @@ async def crear_propuesta(
         # ==========================
         if not p_cod:
             raise HTTPException(400, "El código de cliente es obligatorio")
+        if not p_tipo:
+            raise HTTPException(400, "El tipo de propuesta es obligatorio")
         if not p_spons:
             raise HTTPException(400, "El sponsor es obligatorio")
         if not p_nombre:
@@ -666,16 +703,19 @@ async def crear_propuesta(
             raise HTTPException(400, "El tiempo estimado es obligatorio")
 
         async with database.transaction():
-            await _advisory_lock_por_anio_cliente(p_anio, p_cod)
+            # ✅ CLAVE: lock por año + cliente + tipo
+            await _advisory_lock_por_anio_cliente_tipo(p_anio, p_cod, p_tipo)
 
+            # ✅ CLAVE: correlativo por año + cliente + tipo
             row_next = await database.fetch_one(
                 """
                 SELECT COALESCE(MAX(correlativo), 0) + 1 AS next
                   FROM propuesta
                  WHERE rtrim("año") = :anio
                    AND rtrim(cod_cliente) = :cod
+                   AND rtrim(tipo) = :tipo
                 """,
-                values={"anio": p_anio, "cod": p_cod},
+                values={"anio": p_anio, "cod": p_cod, "tipo": p_tipo},
             )
             correlativo = int(row_next["next"])
 
@@ -708,7 +748,7 @@ async def crear_propuesta(
                     "nombre": p_nombre,
                     "sponsor": p_spons,
                     "tiempo": t_est,
-                    "estado": p_estado_db,      # 👈 ahora viene mapeado desde el front
+                    "estado": p_estado_db,
                     "usuario_id": p.usuario_id,
                 },
             )
@@ -727,6 +767,7 @@ async def crear_propuesta(
     except Exception as e:
         print("crear_propuesta error:", repr(e))
         raise HTTPException(400, f"Error al crear propuesta: {e}")
+
 
 
 @app.get("/propuestas/", response_model=list[PropuestaOut])
@@ -849,7 +890,7 @@ async def actualizar_propuesta(
 ):
     roles = seguridad["roles"]
 
-    if "JEFE PROYECTO" in roles and "ADMINISTRADOR" not in roles:
+    if "JEFE_PROYECTO" in roles and "ADMINISTRADOR" not in roles:
         raise HTTPException(
             status_code=403,
             detail="No tiene permisos para editar propuestas",
@@ -920,7 +961,7 @@ async def actualizar_propuesta(
         est_app = _norm_lower(str(data["estado"]))  # ej: 'canc'
         if est_app not in EST_PROP_APP2DB:
             raise HTTPException(
-                400, "Estado inválido. Usa: cotiz | adju | canc | eliminado"
+                400, "Estado inválido. Usa: cotiz | adju | canc | eliminado | confeccion | anul"
             )
         est_db = EST_PROP_APP2DB[est_app]          # 'CAN'
         set_parts.append("estado = :estado")
@@ -976,7 +1017,7 @@ async def eliminar_propuesta(
 ):
     roles = seguridad["roles"]
 
-    if "JEFE PROYECTO" in roles and "ADMINISTRADOR" not in roles:
+    if "JEFE_PROYECTO" in roles and "ADMINISTRADOR" not in roles:
         raise HTTPException(
             status_code=403,
             detail="No tiene permisos para eliminar propuestas",
@@ -1271,45 +1312,92 @@ async def listar_proyectos(
     user: dict = Depends(obtener_usuario_actual),
 ):
     uid = int(user["id"])
+    roles = [r.upper().strip() for r in user.get("roles", [])]
+    is_admin = "ADMIN" in roles or "ADMINISTRADOR" in roles
 
-    rows = await database.fetch_all(
-        """
-        SELECT
-          v.proyecto_id                         AS id,
-          v.propuesta_id                        AS propuesta_id,
-          RTRIM(p."año")                        AS anio,
-          p.nombre_propuesta                    AS nombre_propuesta,
-          RTRIM(p.tipo)                         AS tipo,
-          p.correlativo                         AS correlativo,
-          RTRIM(p.cod_cliente)                  AS cod_cliente,
-          pr.fecha_inicio,
-          pr.fecha_termino,
-          RTRIM(pr.tipo_facturacion)            AS tipo_facturacion,
-          RTRIM(COALESCE(v.estado,''))          AS estado,
-          v.fecha_estado,
-          pr.jp_cliente,
-          pr.usuario_id,
-          CASE WHEN UPPER(TRIM(COALESCE(v.estado,''))) = 'ELIMINADO'
-               THEN TRUE ELSE FALSE
-          END                                   AS eliminado
-        FROM v_proyectos_visibles v
-        JOIN proyecto  pr ON pr.id = v.proyecto_id
-        JOIN propuesta p  ON p.id = v.propuesta_id
-        WHERE v.usuario_id = :uid
-          AND (
-                :incluir_eliminado = TRUE
-             OR UPPER(TRIM(COALESCE(v.estado, ''))) <> 'ELIMINADO'
-          )
-        ORDER BY
-          CAST(TRIM(p."año") AS int) DESC,
-          v.proyecto_id DESC
-        """,
-        values={
-            "uid": uid,
-            "incluir_eliminado": incluir_eliminado,
-        },
-    )
+    # ============================
+    # ADMIN → ve TODOS los proyectos
+    # ============================
+    if is_admin and not solo_mios:
+        rows = await database.fetch_all(
+            """
+            SELECT
+              pr.id                               AS id,
+              pr.propuesta_id                    AS propuesta_id,
+              RTRIM(p."año")                     AS anio,
+              p.nombre_propuesta                 AS nombre_propuesta,
+              RTRIM(p.tipo)                      AS tipo,
+              p.correlativo                      AS correlativo,
+              RTRIM(p.cod_cliente)               AS cod_cliente,
+              pr.fecha_inicio,
+              pr.fecha_termino,
+              RTRIM(pr.tipo_facturacion)         AS tipo_facturacion,
+              RTRIM(COALESCE(pr.estado,''))      AS estado,
+              pr.fecha_estado,
+              pr.jp_cliente,
+              NULL                               AS usuario_id,
+              CASE WHEN UPPER(TRIM(COALESCE(pr.estado,''))) = 'ELIMINADO'
+                   THEN TRUE ELSE FALSE
+              END                                AS eliminado
+            FROM proyecto pr
+            JOIN propuesta p ON p.id = pr.propuesta_id
+            WHERE (
+                    :incluir_eliminado = TRUE
+                 OR UPPER(TRIM(COALESCE(pr.estado, ''))) <> 'ELIMINADO'
+            )
+            ORDER BY
+              CAST(TRIM(p."año") AS int) DESC,
+              pr.id DESC
+            """,
+            values={
+                "incluir_eliminado": incluir_eliminado,
+            },
+        )
+    # =========================================
+    # NO ADMIN (o admin con solo_mios = true)
+    # =========================================
+    else:
+        rows = await database.fetch_all(
+            """
+            SELECT
+              v.proyecto_id                         AS id,
+              v.propuesta_id                        AS propuesta_id,
+              RTRIM(p."año")                        AS anio,
+              p.nombre_propuesta                    AS nombre_propuesta,
+              RTRIM(p.tipo)                         AS tipo,
+              p.correlativo                         AS correlativo,
+              RTRIM(p.cod_cliente)                  AS cod_cliente,
+              pr.fecha_inicio,
+              pr.fecha_termino,
+              RTRIM(pr.tipo_facturacion)            AS tipo_facturacion,
+              RTRIM(COALESCE(v.estado,''))          AS estado,
+              v.fecha_estado,
+              pr.jp_cliente,
+              pr.usuario_id,
+              CASE WHEN UPPER(TRIM(COALESCE(v.estado,''))) = 'ELIMINADO'
+                   THEN TRUE ELSE FALSE
+              END                                   AS eliminado
+            FROM v_proyectos_visibles v
+            JOIN proyecto  pr ON pr.id = v.proyecto_id
+            JOIN propuesta p  ON p.id = v.propuesta_id
+            WHERE v.usuario_id = :uid
+              AND (
+                    :incluir_eliminado = TRUE
+                 OR UPPER(TRIM(COALESCE(v.estado, ''))) <> 'ELIMINADO'
+              )
+            ORDER BY
+              CAST(TRIM(p."año") AS int) DESC,
+              v.proyecto_id DESC
+            """,
+            values={
+                "uid": uid,
+                "incluir_eliminado": incluir_eliminado,
+            },
+        )
 
+    # ============================
+    # Post-procesado (igual al tuyo)
+    # ============================
     out = []
     for r in rows:
         d = dict(r)
@@ -1318,12 +1406,15 @@ async def listar_proyectos(
             d["anio"], d["tipo"], d["correlativo"], d["cod_cliente"]
         )
         out.append(d)
+
     return out
 
 
 @app.get("/proyectos/{proyecto_id}", response_model=ProyectoOut)
 async def obtener_proyecto(proyecto_id: int, user: dict = Depends(obtener_usuario_actual)):
     uid = int(user["id"])
+    roles = [r.upper().strip() for r in user.get("roles", [])]
+    is_admin = "ADMIN" in roles or "ADMINISTRADOR" in roles
 
     row = await database.fetch_one(
         """
@@ -1345,27 +1436,38 @@ async def obtener_proyecto(proyecto_id: int, user: dict = Depends(obtener_usuari
         FROM proyecto pr
         JOIN propuesta p ON p.id = pr.propuesta_id
         WHERE pr.id = :id
-          AND EXISTS (
-                SELECT 1
-                  FROM v_proyectos_visibles v
-                 WHERE v.proyecto_id = pr.id
-                   AND v.usuario_id  = :uid
+          AND (
+                :is_admin = TRUE
+             OR EXISTS (
+                    SELECT 1
+                      FROM v_proyectos_visibles v
+                     WHERE v.proyecto_id = pr.id
+                       AND v.usuario_id  = :uid
+                )
           )
         """,
-        values={"id": proyecto_id, "uid": uid},
+        values={"id": proyecto_id, "uid": uid, "is_admin": is_admin},
     )
+
     if not row:
+        # Si es admin y no existe → 404 real
+        # Si no es admin → puede ser no existe o no autorizado (mantengo tu mensaje)
         raise HTTPException(status_code=404, detail="Proyecto no encontrado o no autorizado")
 
     d = dict(row)
-    d["nombre_auto"] = build_nombre_auto(d["anio"], d["tipo"], d["correlativo"], d["cod_cliente"])
+    d["estado"] = (d.get("estado") or "").strip().lower()
+    d["nombre_auto"] = build_nombre_auto(
+        d["anio"], d["tipo"], d["correlativo"], d["cod_cliente"]
+    )
     for k in ("tipo", "correlativo", "cod_cliente"):
         d.pop(k, None)
     return d
 
 
+
 @app.patch("/proyectos/{proyecto_id}", response_model=ProyectoOut)
-async def patch_proyecto(proyecto_id: int, body: dict = Body(...)):
+async def patch_proyecto(proyecto_id: int, body: dict = Body(...), user=Depends(obtener_usuario_actual)):
+    # aquí puedes filtrar por roles si quieres
     allowed = {
         "propuesta_id", "fecha_inicio", "fecha_termino",
         "tipo_facturacion", "estado", "fecha_estado", "jp_cliente"
@@ -1448,7 +1550,7 @@ async def patch_proyecto(proyecto_id: int, body: dict = Body(...)):
     return d
 
 @app.delete("/proyectos/{proyecto_id}")
-async def eliminar_proyecto(proyecto_id: int):
+async def eliminar_proyecto(proyecto_id: int, user=Depends(obtener_usuario_actual)):
     r = await database.fetch_one(
         """
         UPDATE proyecto
@@ -1582,6 +1684,11 @@ async def sync_proyecto_estado_from_last_avance(proyecto_id: int) -> None:
 
 @app.post("/avances/", response_model=AvanceOut)
 async def crear_avance(body: AvanceIn, user=Depends(obtener_usuario_actual)):
+    roles = [r.upper().strip() for r in user.get("roles", [])]
+    is_admin = "ADMIN" in roles or "ADMINISTRADOR" in roles
+    if is_admin:
+        raise HTTPException(status_code=403, detail="Admin solo puede ver avances (no crear/editar).")
+
     if body.estado is not None and not await is_valid_estado_codigo(body.estado):
         raise HTTPException(400, "Estado de avance inválido")
 
@@ -1614,15 +1721,42 @@ async def crear_avance(body: AvanceIn, user=Depends(obtener_usuario_actual)):
 async def listar_avances(
     proyecto_id: int | None = Query(None),
     solo_mios: bool = Query(False),
-    usuario_actual = Depends(obtener_usuario_actual),
+    usuario_actual=Depends(obtener_usuario_actual),
 ):
+    roles = [r.upper().strip() for r in usuario_actual.get("roles", [])]
+    is_admin = "ADMIN" in roles or "ADMINISTRADOR" in roles
+    uid = int(usuario_actual["id"])
+
+    # Admin: para evitar listado masivo accidental, obliga proyecto_id
+    if is_admin and proyecto_id is None:
+        raise HTTPException(status_code=400, detail="Como admin, debes indicar proyecto_id para listar avances.")
+
+    # No admin: si no manda proyecto_id, solo puede ver los suyos
+    if not is_admin and proyecto_id is None and not solo_mios:
+        raise HTTPException(status_code=400, detail="Debes indicar proyecto_id o solo_mios=true.")
+
+    # Si NO admin y viene proyecto_id: valida que el proyecto le sea visible
+    if not is_admin and proyecto_id is not None:
+        ok = await database.fetch_one(
+            """
+            SELECT 1
+            FROM v_proyectos_visibles v
+            WHERE v.usuario_id = :uid
+              AND v.proyecto_id = :pid
+            LIMIT 1
+            """,
+            {"uid": uid, "pid": proyecto_id},
+        )
+        if not ok:
+            raise HTTPException(status_code=403, detail="No tienes acceso a este proyecto.")
+
     condiciones, valores = [], {}
     if proyecto_id is not None:
         condiciones.append("a.proyecto_id = :p")
         valores["p"] = proyecto_id
     if solo_mios:
         condiciones.append("a.usuario_id = :u")
-        valores["u"] = usuario_actual["id"]
+        valores["u"] = uid
 
     where_sql = "WHERE " + " AND ".join(condiciones) if condiciones else ""
     rows = await database.fetch_all(
@@ -1631,7 +1765,7 @@ async def listar_avances(
           a.id,
           a.proyecto_id,
           a.fecha,
-          rtrim(a.estado) AS estado, 
+          rtrim(a.estado) AS estado,
           a.comentario,
           a.hito,
           a.usuario_id
@@ -1644,8 +1778,14 @@ async def listar_avances(
     return [dict(r) for r in rows]
 
 
+
 @app.patch("/avances/{avance_id}", response_model=AvanceOut)
 async def patch_avance(avance_id: int, body: AvancePatch, user=Depends(obtener_usuario_actual)):
+    roles = [r.upper().strip() for r in user.get("roles", [])]
+    is_admin = "ADMIN" in roles or "ADMINISTRADOR" in roles
+    if is_admin:
+        raise HTTPException(status_code=403, detail="Admin solo puede ver avances (no editar).")
+
     avance = await database.fetch_one("SELECT * FROM avance WHERE id=:id", {"id": avance_id})
     if not avance:
         raise HTTPException(404, "No existe el avance")
@@ -1685,8 +1825,14 @@ async def patch_avance(avance_id: int, body: AvancePatch, user=Depends(obtener_u
     row = await database.fetch_one("SELECT * FROM avance WHERE id=:id", {"id": avance_id})
     return AvanceOut(**row)
 
+
 @app.delete("/avances/{avance_id}")
-async def eliminar_avance(avance_id: int):
+async def eliminar_avance(avance_id: int, user=Depends(obtener_usuario_actual)):
+    roles = [r.upper().strip() for r in user.get("roles", [])]
+    is_admin = "ADMIN" in roles or "ADMINISTRADOR" in roles
+    if is_admin:
+        raise HTTPException(status_code=403, detail="Admin solo puede ver avances (no eliminar).")
+
     a = await database.fetch_one("SELECT id, proyecto_id FROM avance WHERE id = :id", {"id": avance_id})
     if not a:
         raise HTTPException(404, "Avance no encontrado")
@@ -1707,6 +1853,7 @@ async def eliminar_avance(avance_id: int):
         await sync_proyecto_estado_from_last_avance(a["proyecto_id"])
 
     return {"mensaje": "Avance eliminado"}
+
 
 # ----------------------------------------------------------
 # 🔹 DASHBOARD
@@ -1817,8 +1964,31 @@ async def dashboard_proyectos_por_estado():
 # ======================
 # EQUIPOS
 # ======================
+async def _validar_usuario_activo(usuario_id: int):
+    u = await database.fetch_one(
+        "SELECT id, username, activo FROM usuario WHERE id = :id",
+        {"id": usuario_id},
+    )
+    if not u:
+        raise HTTPException(status_code=400, detail="Usuario no existe")
+
+    activo = u["activo"]
+    # Por si viene como bool / int / string
+    es_activo = bool(activo) and str(activo).strip() not in ("0", "false", "False")
+
+    if not es_activo:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No se puede asignar: el usuario '{u['username']}' no está vigente (inactivo).",
+        )
+
 @app.post("/equipos/", response_model=EquipoOut)
 async def crear_equipo(e: EquipoIn, usuario_actual=Depends(obtener_usuario_actual)):
+    roles = [r.upper().strip() for r in usuario_actual.get("roles", [])]
+    is_admin = "ADMIN" in roles or "ADMINISTRADOR" in roles
+    if is_admin:
+        raise HTTPException(status_code=403, detail="Admin solo puede ver equipo (no crear/editar).")
+
     rol = (e.rol or "").strip().upper()
     if rol not in ("JP", "DEV"):
         raise HTTPException(400, "rol inválido (usa JP o DEV)")
@@ -1839,10 +2009,15 @@ async def crear_equipo(e: EquipoIn, usuario_actual=Depends(obtener_usuario_actua
     if not proy:
         raise HTTPException(404, "Proyecto no existe o está eliminado")
 
-    usu = await database.fetch_one("SELECT id FROM usuario WHERE id = :id", values={"id": e.usuario_id})
+    # ✅ Usuario vigente (activo = true)
+    usu = await database.fetch_one(
+        "SELECT id FROM usuario WHERE id = :id AND activo = true",
+        values={"id": e.usuario_id},
+    )
     if not usu:
-        raise HTTPException(404, "Usuario no existe")
+        raise HTTPException(404, "Usuario no existe o no está vigente")
 
+    # Mantener: no permitir solape del mismo usuario dentro del mismo proyecto
     exist_solapa = await database.fetch_one(
         """
         SELECT id
@@ -1860,21 +2035,21 @@ async def crear_equipo(e: EquipoIn, usuario_actual=Depends(obtener_usuario_actua
     if exist_solapa:
         raise HTTPException(409, "Ya existe participación de este usuario en el proyecto que solapa el período")
 
-    tot = await database.fetch_one(
+    # ✅ Capacidad GLOBAL: suma en todos los proyectos solapados <= 100
+    tot_global = await database.fetch_one(
         """
         SELECT COALESCE(SUM(dedicacion), 0) AS total
           FROM equipo
-         WHERE proyecto_id = :p
-           AND usuario_id  = :u
+         WHERE usuario_id = :u
            AND NOT (
                 COALESCE(:hasta, DATE '9999-12-31') < fecha_desde
              OR COALESCE(fecha_hasta, DATE '9999-12-31') < :desde
            )
         """,
-        values={"p": e.proyecto_id, "u": e.usuario_id, "desde": fecha_desde, "hasta": fecha_hasta},
+        values={"u": e.usuario_id, "desde": fecha_desde, "hasta": fecha_hasta},
     )
-    if float(tot["total"] or 0) + float(e.dedicacion) > 100:
-        raise HTTPException(400, "La dedicación acumulada superaría 100% en el período")
+    if float(tot_global["total"] or 0) + float(e.dedicacion) > 100:
+        raise HTTPException(400, "La dedicación total del recurso superaría 100% en el período")
 
     row = await database.fetch_one(
         """
@@ -1895,9 +2070,30 @@ async def crear_equipo(e: EquipoIn, usuario_actual=Depends(obtener_usuario_actua
     u = await database.fetch_one("SELECT username FROM usuario WHERE id=:id", {"id": row["usuario_id"]})
     return {**dict(row), "usuario_nombre": u["username"] if u else None}
 
-
 @app.get("/equipos/", response_model=list[EquipoOut])
-async def listar_equipos(proyecto_id: int = Query(...)):
+async def listar_equipos(
+    proyecto_id: int = Query(...),
+    usuario_actual=Depends(obtener_usuario_actual),
+):
+    roles = [r.upper().strip() for r in usuario_actual.get("roles", [])]
+    is_admin = "ADMIN" in roles or "ADMINISTRADOR" in roles
+    uid = int(usuario_actual["id"])
+
+    # No admin: validar acceso al proyecto
+    if not is_admin:
+        ok = await database.fetch_one(
+            """
+            SELECT 1
+            FROM v_proyectos_visibles v
+            WHERE v.usuario_id = :uid
+              AND v.proyecto_id = :pid
+            LIMIT 1
+            """,
+            {"uid": uid, "pid": proyecto_id},
+        )
+        if not ok:
+            raise HTTPException(status_code=403, detail="No tienes acceso a este proyecto.")
+
     rows = await database.fetch_all(
         """
         SELECT e.id, e.proyecto_id, e.usuario_id, u.username AS usuario_nombre,
@@ -1914,7 +2110,18 @@ async def listar_equipos(proyecto_id: int = Query(...)):
 
 
 @app.patch("/equipos/{equipo_id}", response_model=EquipoOut)
-async def patch_equipo(equipo_id: int, body: dict = Body(...)):
+async def patch_equipo(
+    equipo_id: int,
+    body: dict = Body(...),
+    usuario_actual=Depends(obtener_usuario_actual),
+):
+    roles = [r.upper().strip() for r in usuario_actual.get("roles", [])]
+    is_admin = "ADMIN" in roles or "ADMINISTRADOR" in roles
+    uid = int(usuario_actual["id"])
+
+    if is_admin:
+        raise HTTPException(status_code=403, detail="Admin solo puede ver equipo (no editar).")
+
     allowed = {"rol", "dedicacion", "fecha_desde", "fecha_hasta", "comentario", "usuario_id"}
     data = {k: v for k, v in body.items() if k in allowed}
     if not data:
@@ -1924,11 +2131,25 @@ async def patch_equipo(equipo_id: int, body: dict = Body(...)):
     if not actual:
         raise HTTPException(404, "Equipo no encontrado")
 
+    # No admin: validar acceso al proyecto
+    ok = await database.fetch_one(
+        """
+        SELECT 1
+        FROM v_proyectos_visibles v
+        WHERE v.usuario_id = :uid
+          AND v.proyecto_id = :pid
+        LIMIT 1
+        """,
+        {"uid": uid, "pid": int(actual["proyecto_id"])},
+    )
+    if not ok:
+        raise HTTPException(status_code=403, detail="No tienes acceso a este proyecto.")
+
     rol = (data.get("rol", actual["rol"]) or "").strip().upper()
     if rol not in ("JP", "DEV"):
         raise HTTPException(400, "rol inválido (usa JP o DEV)")
 
-    dedicacion  = float(data.get("dedicacion", actual["dedicacion"]))
+    dedicacion = float(data.get("dedicacion", actual["dedicacion"]))
     if not (0 <= dedicacion <= 100):
         raise HTTPException(400, "La dedicación debe ser entre 0 y 100")
 
@@ -1945,7 +2166,7 @@ async def patch_equipo(equipo_id: int, body: dict = Body(...)):
     if fecha_hasta is not None and fecha_desde > fecha_hasta:
         raise HTTPException(400, "La fecha_desde no puede ser mayor a fecha_hasta")
 
-    usuario_id  = int(data.get("usuario_id", actual["usuario_id"]))
+    usuario_id = int(data.get("usuario_id", actual["usuario_id"]))
     proyecto_id = int(actual["proyecto_id"])
 
     proy = await database.fetch_one(
@@ -1955,6 +2176,15 @@ async def patch_equipo(equipo_id: int, body: dict = Body(...)):
     if not proy:
         raise HTTPException(409, "No se puede modificar: el proyecto está eliminado o no existe")
 
+    # ✅ Usuario vigente (activo = true)
+    usu = await database.fetch_one(
+        "SELECT id FROM usuario WHERE id = :id AND activo = true",
+        {"id": usuario_id},
+    )
+    if not usu:
+        raise HTTPException(404, "Usuario no existe o no está vigente")
+
+    # Mantener: no permitir solape del mismo usuario dentro del mismo proyecto
     exist_solapa = await database.fetch_one(
         """
         SELECT id
@@ -1973,22 +2203,22 @@ async def patch_equipo(equipo_id: int, body: dict = Body(...)):
     if exist_solapa:
         raise HTTPException(409, "Ya existe participación de este usuario que solapa el período")
 
-    tot = await database.fetch_one(
+    # ✅ Capacidad GLOBAL (sin proyecto_id), excluyendo este registro
+    tot_global = await database.fetch_one(
         """
         SELECT COALESCE(SUM(dedicacion), 0) AS total
           FROM equipo
-         WHERE proyecto_id = :p
-           AND usuario_id  = :u
+         WHERE usuario_id  = :u
            AND id <> :id
            AND NOT (
                 COALESCE(:hasta, DATE '9999-12-31') < fecha_desde
              OR COALESCE(fecha_hasta, DATE '9999-12-31') < :desde
            )
         """,
-        {"p": proyecto_id, "u": usuario_id, "id": equipo_id, "desde": fecha_desde, "hasta": fecha_hasta},
+        {"u": usuario_id, "id": equipo_id, "desde": fecha_desde, "hasta": fecha_hasta},
     )
-    if float(tot["total"] or 0) + dedicacion > 100:
-        raise HTTPException(400, "La dedicación acumulada superaría 100% en el período")
+    if float(tot_global["total"] or 0) + dedicacion > 100:
+        raise HTTPException(400, "La dedicación total del recurso superaría 100% en el período")
 
     row = await database.fetch_one(
         """
@@ -2016,11 +2246,43 @@ async def patch_equipo(equipo_id: int, body: dict = Body(...)):
     return {**dict(row), "usuario_nombre": u["username"] if u else None}
 
 @app.delete("/equipos/{equipo_id}")
-async def eliminar_equipo(equipo_id: int):
-    r = await database.fetch_one("DELETE FROM equipo WHERE id = :id RETURNING id", values={"id": equipo_id})
+async def eliminar_equipo(equipo_id: int, usuario_actual=Depends(obtener_usuario_actual)):
+    roles = [r.upper().strip() for r in usuario_actual.get("roles", [])]
+    is_admin = "ADMIN" in roles or "ADMINISTRADOR" in roles
+    uid = int(usuario_actual["id"])
+
+    if is_admin:
+        raise HTTPException(status_code=403, detail="Admin solo puede ver equipo (no eliminar).")
+
+    actual = await database.fetch_one(
+        "SELECT id, proyecto_id FROM equipo WHERE id = :id",
+        values={"id": equipo_id},
+    )
+    if not actual:
+        raise HTTPException(status_code=404, detail="Equipo no encontrado")
+
+    ok = await database.fetch_one(
+        """
+        SELECT 1
+        FROM v_proyectos_visibles v
+        WHERE v.usuario_id = :uid
+          AND v.proyecto_id = :pid
+        LIMIT 1
+        """,
+        {"uid": uid, "pid": int(actual["proyecto_id"])},
+    )
+    if not ok:
+        raise HTTPException(status_code=403, detail="No tienes acceso a este proyecto.")
+
+    r = await database.fetch_one(
+        "DELETE FROM equipo WHERE id = :id RETURNING id",
+        values={"id": equipo_id},
+    )
     if not r:
         raise HTTPException(status_code=404, detail="Equipo no encontrado")
+
     return {"mensaje": "Equipo eliminado"}
+
 
 # ======================
 # FACTURAS (SECCION CORREGIDA)
@@ -2306,6 +2568,39 @@ async def eliminar_rol_catalogo(id: int, user=Depends(obtener_usuario_actual)):
              raise HTTPException(409, "No se puede eliminar: este rol está asignado a usuarios")
         raise HTTPException(400, f"Error eliminando rol: {e}")
 
+@app.patch("/roles/catalogo/{id_catalogo}", response_model=dict)
+async def actualizar_rol_catalogo(
+    id_catalogo: int,
+    body: dict,
+    user=Depends(obtener_usuario_actual),
+):
+    nombre = body.get("nombre_rol") or body.get("rol") or body.get("nombre")
+    if not nombre:
+        raise HTTPException(400, "nombre_rol es requerido")
+
+    nombre = str(nombre).strip()
+    if not nombre:
+        raise HTTPException(400, "nombre_rol es requerido")
+
+    try:
+        q = """
+        UPDATE public.rol_catalogo
+           SET nombre_rol = :nombre
+         WHERE id = :id
+         RETURNING id, nombre_rol
+        """
+        r = await database.fetch_one(q, values={"nombre": nombre, "id": id_catalogo})
+        if not r:
+            raise HTTPException(404, "Rol no encontrado en el catálogo")
+        return dict(r)
+
+    except Exception as e:
+        # si tienes unique constraint por nombre, ajusta el texto según el nombre real
+        if "rol_catalogo" in str(e).lower() and "key" in str(e).lower():
+            raise HTTPException(409, "Ese nombre de rol ya existe")
+        raise HTTPException(400, f"Error actualizando rol: {e}")
+
+
 @app.post("/usuarios/roles/", response_model=UsuarioRolOut)
 async def asignar_rol_a_usuario(body: UsuarioRolIn, user=Depends(obtener_usuario_actual)):
     try:
@@ -2578,7 +2873,8 @@ async def login_microsoft_callback(request: Request):
     frontend_callback = os.getenv("FRONTEND_CALLBACK_URL", "http://localhost:4200/login/callback")
     return RedirectResponse(f"{frontend_callback}?token={token_jwt}")
 
+
+
 @app.get("/version")
-async def obtener_version():
-    row = await database.fetch_one("SELECT version()")
-    return {"version": row["version"]}
+def version():
+    return {"version": "BACKEND_ACTUALIZADO_2026-02-10"}
